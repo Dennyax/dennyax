@@ -1,0 +1,16 @@
+# Исходные данные моделирования (гигабайты) - не в репозиторий
+*.nc
+*.hdf
+*.hdf5
+*.grib
+*.grib2
+
+# Рисунки, которые строит скрипт (при необходимости добавьте нужные вручную: git add -f)
+output/
+Output/
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/

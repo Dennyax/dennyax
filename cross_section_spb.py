@@ -1,15 +1,20 @@
 import os
+import json
 import datetime as dt
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
 import matplotlib.pyplot as plt
 
-main_dir = "/Users/dgranin/Research/Activity/WRF-Chem_out/"
+repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Пути можно задать переменными окружения WRF_OUT_DIR и WRF_SAVE_DIR (удобно при запуске из клона репозитория)
+main_dir = os.environ.get('WRF_OUT_DIR', "/Users/dgranin/Research/Activity/WRF-Chem_out/")
+save_dir = os.environ.get('WRF_SAVE_DIR', os.path.join(repo_dir, 'output'))
+data_dir = os.path.join(repo_dir, 'data')   # осреднённые разрезы (.npz) - маленькие, их можно коммитить
 data1 = 'wrfout_meteo_2021-07_urb_modif.nc'
 data2 = 'wrfout_meteo_2021-07_no_urb.nc'
 data3 = 'wrfout_meteo_2021-07_no_spb.nc'
-save_dir = "/Users/dgranin/Research/Activity/WRF-Chem_out/Output/"
 
 # Какую разность строим: ΔT = эксперимент - контроль
 file_exp, label_exp = data1, 'urb_modif'
@@ -37,11 +42,22 @@ utc_shift = 0       # 0 - сроки в UTC; 3 - местное время (UTC+
 start_date = dt.datetime(2021, 7, 1, 0)
 step_hours = 1
 
+# True: если в data/ есть .npz с теми же параметрами, wrfout не читаем (рисунок строится из .npz)
+use_cache = True
 save_fig = True
 
 G = 9.81
 R_D = 287.0
 CP = 1004.5
+
+tz_label = 'UTC' if utc_shift == 0 else f'UTC{utc_shift:+d}'
+
+# Параметры, от которых зависит содержимое .npz: при их изменении кэш пересчитывается
+config = dict(file_exp=file_exp, file_ctrl=file_ctrl, var_name=var_name,
+              target_lat=target_lat, lon_min=lon_min, lon_max=lon_max,
+              z_top=z_top, n_levels=n_levels, hours_sel=hours_sel, utc_shift=utc_shift)
+config_str = json.dumps(config, sort_keys=True)
+npz_path = os.path.join(data_dir, f'section_spb_{label_exp}_minus_{label_ctrl}.npz')
 
 
 def read_times(ds):
@@ -102,75 +118,116 @@ def hourly_means(path, hour_idx, nz, window):
     return means
 
 
-with nc.Dataset(f'{main_dir}{file_ctrl}', 'r') as ds:
-    lat2d = static_field(ds, 'XLAT', 2)
-    lon2d = static_field(ds, 'XLONG', 2)
-    times = read_times(ds)
+def compute_section():
+    """Читает wrfout и считает ΔT вдоль разреза для каждого срока."""
+    path_ctrl = os.path.join(main_dir, file_ctrl)
+    path_exp = os.path.join(main_dir, file_exp)
 
-    jj, ii = find_section(lat2d, lon2d, target_lat, lon_min, lon_max)
-    lons = lon2d[jj, ii]
-    order = np.argsort(lons)
-    jj, ii, lons = jj[order], ii[order], lons[order]
+    with nc.Dataset(path_ctrl, 'r') as ds:
+        lat2d = static_field(ds, 'XLAT', 2)
+        lon2d = static_field(ds, 'XLONG', 2)
+        times = read_times(ds)
 
-    if 'PHB' in ds.variables:
-        # высота уровней модели над поверхностью по базовому состоянию (одинакова в обоих экспериментах)
-        phb = static_field(ds, 'PHB', 3)[:, jj, ii] / G
-        z = 0.5 * (phb[:-1] + phb[1:]) - phb[0]
-        y_label, y_top, y_bottom = 'Height above ground, m', z_top, 0
-    else:
-        nz_all = len(ds.dimensions['bottom_top'])
-        z = np.repeat(np.arange(1, nz_all + 1)[:, None], len(jj), axis=1)
-        y_label, y_top, y_bottom = 'Model levels', n_levels, 1
+        jj, ii = find_section(lat2d, lon2d, target_lat, lon_min, lon_max)
+        lons = lon2d[jj, ii]
+        order = np.argsort(lons)
+        jj, ii, lons = jj[order], ii[order], lons[order]
 
-with nc.Dataset(f'{main_dir}{file_exp}', 'r') as ds:
-    if not read_times(ds).equals(times):
-        raise ValueError('Временные оси экспериментов не совпадают')
+        if 'PHB' in ds.variables:
+            # высота уровней модели над поверхностью по базовому состоянию (одинакова в обоих экспериментах)
+            phb = static_field(ds, 'PHB', 3)[:, jj, ii] / G
+            z = 0.5 * (phb[:-1] + phb[1:]) - phb[0]
+            y_label, y_top, y_bottom = 'Height above ground, m', z_top, 0
+        else:
+            nz_all = len(ds.dimensions['bottom_top'])
+            z = np.repeat(np.arange(1, nz_all + 1)[:, None], len(jj), axis=1)
+            y_label, y_top, y_bottom = 'Model levels', n_levels, 1
 
-# Читаем только уровни ниже верха разреза и только прямоугольник вокруг разреза
-above = np.where(z.min(axis=1) > y_top)[0]
-nz_use = above[0] + 1 if above.size else z.shape[0]
-z = z[:nz_use]
-window = (jj.min(), jj.max() + 1, ii.min(), ii.max() + 1)
+    with nc.Dataset(path_exp, 'r') as ds:
+        if not read_times(ds).equals(times):
+            raise ValueError('Временные оси экспериментов не совпадают')
 
-# Сроки: в файле время UTC, при необходимости сдвигаем на местное
-local_times = times + pd.Timedelta(hours=utc_shift)
-tz_label = 'UTC' if utc_shift == 0 else f'UTC{utc_shift:+d}'
-hour_idx = {h: np.where((local_times.hour == h) & (local_times.minute == 0))[0] for h in hours_sel}
-for h, idx in hour_idx.items():
-    if idx.size == 0:
-        raise ValueError(f'В данных нет срока {h:02d} {tz_label}')
+    # Читаем только уровни ниже верха разреза и только прямоугольник вокруг разреза
+    above = np.where(z.min(axis=1) > y_top)[0]
+    nz_use = above[0] + 1 if above.size else z.shape[0]
+    z = z[:nz_use]
+    window = (jj.min(), jj.max() + 1, ii.min(), ii.max() + 1)
 
-print(f'Целевая широта: {target_lat}, '
-      f'в модели вдоль разреза: {lat2d[jj, ii].min():.4f} - {lat2d[jj, ii].max():.4f}')
-print(f'Выбранный диапазон долгот: {lons[0]:.4f} - {lons[-1]:.4f} ({len(jj)} точек)')
-print(f'Верх разреза: {y_top:.0f} ({y_label}), уровней модели: {nz_use}')
-print(f'Осреднение по периоду: {times[0].strftime("%d-%m-%Y %H:00")} - '
-      f'{times[-1].strftime("%d-%m-%Y %H:00")} UTC')
-print('Число сроков в среднем: ' + ', '.join(f'{h:02d} {tz_label} - {idx.size}' for h, idx in hour_idx.items()))
+    # Сроки: в файле время UTC, при необходимости сдвигаем на местное
+    local_times = times + pd.Timedelta(hours=utc_shift)
+    hour_idx = {h: np.where((local_times.hour == h) & (local_times.minute == 0))[0] for h in hours_sel}
+    for h, idx in hour_idx.items():
+        if idx.size == 0:
+            raise ValueError(f'В данных нет срока {h:02d} {tz_label}')
 
-mean_exp = hourly_means(f'{main_dir}{file_exp}', hour_idx, nz_use, window)
-mean_ctrl = hourly_means(f'{main_dir}{file_ctrl}', hour_idx, nz_use, window)
+    period = (f'{times[0].strftime("%d-%m-%Y %H:00")} - {times[-1].strftime("%d-%m-%Y %H:00")} UTC')
+    print(f'Целевая широта: {target_lat}, '
+          f'в модели вдоль разреза: {lat2d[jj, ii].min():.4f} - {lat2d[jj, ii].max():.4f}')
+    print(f'Выбранный диапазон долгот: {lons[0]:.4f} - {lons[-1]:.4f} ({len(jj)} точек)')
+    print(f'Верх разреза: {y_top:.0f} ({y_label}), уровней модели: {nz_use}')
+    print(f'Осреднение по периоду: {period}')
+    print('Число сроков в среднем: '
+          + ', '.join(f'{h:02d} {tz_label} - {idx.size}' for h, idx in hour_idx.items()))
 
-# Разность средних = среднее разностей; берём только ячейки разреза: (уровень, точка)
-params = {h: (mean_exp[h] - mean_ctrl[h])[:, jj - window[0], ii - window[2]] for h in hours_sel}
+    mean_exp = hourly_means(path_exp, hour_idx, nz_use, window)
+    mean_ctrl = hourly_means(path_ctrl, hour_idx, nz_use, window)
 
-Lons = np.tile(lons, (nz_use, 1))
+    # Разность средних = среднее разностей; берём только ячейки разреза: (уровень, точка)
+    params = np.stack([(mean_exp[h] - mean_ctrl[h])[:, jj - window[0], ii - window[2]] for h in hours_sel])
+
+    return dict(lons=lons, z=z, params=params,
+                counts=np.array([hour_idx[h].size for h in hours_sel]),
+                y_label=y_label, y_top=y_top, y_bottom=y_bottom, period=period)
+
+
+def save_section(section):
+    os.makedirs(data_dir, exist_ok=True)
+    np.savez_compressed(npz_path, config=config_str, **section)
+
+
+def load_section():
+    if not (use_cache and os.path.exists(npz_path)):
+        return None
+    with np.load(npz_path) as f:
+        if str(f['config']) != config_str:
+            print(f'Параметры в {npz_path} отличаются от текущих - пересчитываем из wrfout')
+            return None
+        section = {k: f[k] for k in f.files if k != 'config'}
+    for k in ('y_label', 'period'):
+        section[k] = str(section[k])
+    for k in ('y_top', 'y_bottom'):
+        section[k] = float(section[k])
+    return section
+
+
+section = load_section()
+if section is None:
+    section = compute_section()
+    save_section(section)
+    print(f'Осреднённые разрезы сохранены: {npz_path}')
+else:
+    print(f'Осреднённые разрезы загружены из {npz_path} (период: {section["period"]}), wrfout не читались')
+
+lons, z, params = section['lons'], section['z'], section['params']
+y_label, y_top, y_bottom = section['y_label'], section['y_top'], section['y_bottom']
+
+Lons = np.tile(lons, (z.shape[0], 1))
 
 # Общие симметричные уровни для всех сроков (одна шкала на 4 панели)
 step = 0.2
-vmax = max(np.ceil(max(np.nanmax(np.abs(p)) for p in params.values()) / step) * step, step)
+vmax = max(np.ceil(np.nanmax(np.abs(params)) / step) * step, step)
 contour_levels = np.arange(-vmax, vmax + step / 2, step)
 # contour_levels = np.arange(-0.5, 1.1, 0.2)   # или вручную
 
 fig, axes = plt.subplots(len(hours_sel), 1, figsize=(12, 3.8 * len(hours_sel)),
                          sharex=True, sharey=True, layout='constrained')
 
-for ax, h in zip(axes, hours_sel):
+for ax, h, param in zip(axes, hours_sel, params):
     ax.set_axisbelow(True)
     for axis in ['top', 'bottom', 'left', 'right']:
         ax.spines[axis].set_linewidth(2.0)
 
-    cf = ax.contourf(Lons, z, params[h],
+    cf = ax.contourf(Lons, z, param,
                      levels=contour_levels,
                      cmap='coolwarm',
                      extend='both',
@@ -198,5 +255,5 @@ cbar.ax.tick_params(labelsize=14)
 
 if save_fig:
     os.makedirs(save_dir, exist_ok=True)
-    fname = f"{save_dir}cross_section_spb_{label_exp}_minus_{label_ctrl}.png"
+    fname = os.path.join(save_dir, f"cross_section_spb_{label_exp}_minus_{label_ctrl}.png")
     fig.savefig(fname, bbox_inches='tight', dpi=300)
